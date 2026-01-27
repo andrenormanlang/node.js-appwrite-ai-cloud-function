@@ -1,6 +1,30 @@
 const { GoogleGenerativeAI } = require("@google/generative-ai");
 const axios = require("axios");
 
+function normalizeWhitespace(text) {
+  return String(text || "")
+    .replace(/\r\n/g, "\n")
+    .replace(/[ \t]+/g, " ")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
+}
+
+function clampText(text, maxChars) {
+  const normalized = normalizeWhitespace(text);
+  if (!maxChars || normalized.length <= maxChars) return normalized;
+
+  const slice = normalized.slice(0, maxChars);
+  const lastBreak = Math.max(
+    slice.lastIndexOf(". "),
+    slice.lastIndexOf("! "),
+    slice.lastIndexOf("? "),
+    slice.lastIndexOf("\n"),
+  );
+
+  const cut = lastBreak > 60 ? slice.slice(0, lastBreak + 1) : slice;
+  return cut.trim();
+}
+
 module.exports = async function ({ req, res, log, error: logError }) {
   // Retrieve and validate secrets and configuration
   const apiKey = process.env.GEMINI_API_KEY;
@@ -42,7 +66,7 @@ module.exports = async function ({ req, res, log, error: logError }) {
     });
   }
 
-  const { title, status, rating } = payload;
+  const { title, status, rating, mode } = payload;
 
   if (!title || !status) {
     logError("Missing required fields: title or status");
@@ -61,7 +85,8 @@ module.exports = async function ({ req, res, log, error: logError }) {
 
     const searchUrl = `https://customsearch.googleapis.com/customsearch/v1?key=${searchApiKey}&cx=${searchEngineId}&q=${searchQuery}`;
     log(
-      "Making search request to: " + searchUrl.replace(searchApiKey, "REDACTED")
+      "Making search request to: " +
+        searchUrl.replace(searchApiKey, "REDACTED"),
     );
 
     let searchInfo = [];
@@ -82,13 +107,13 @@ module.exports = async function ({ req, res, log, error: logError }) {
       } else {
         log(
           "No search results found in response: " +
-            JSON.stringify(searchResponse.data)
+            JSON.stringify(searchResponse.data),
         );
       }
     } catch (searchError) {
       const errorDetails = searchError.response?.data || searchError.message;
       logError(
-        "Google Search API error details: " + JSON.stringify(errorDetails)
+        "Google Search API error details: " + JSON.stringify(errorDetails),
       );
       // Continue without search results rather than failing completely
       log("Proceeding without search results due to API error");
@@ -98,45 +123,47 @@ module.exports = async function ({ req, res, log, error: logError }) {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    // Create prompt with or without search results
-    let prompt;
-    if (searchInfo.length > 0) {
-      const searchContext = searchInfo
-        .map((info) => `Source: ${info.title}\nInfo: ${info.snippet}`)
-        .join("\n\n");
+    const descriptionMode = String(mode || "short").toLowerCase();
+    const isLong = descriptionMode === "long" || descriptionMode === "full";
+    const maxChars = isLong ? 1200 : 250;
 
-      prompt = `Generate a brief, engaging description (under 250 characters) for a comic book.
-      Use this real information about the comic if relevant:
-      
-      ${searchContext}
-      
-      Comic Details:
-      Title: ${title}
-      Status: ${status}
-      ${rating > 0 ? `Rating: ${rating}/5` : ""}
-      
-      Create an informative and appealing description that includes real details from the search results if relevant.
-      Focus on being interesting and inviting while maintaining accuracy.`;
-    } else {
-      prompt = `Generate a brief, engaging description (under 1000 characters) for a comic book.
-      Comic Details:
-      Title: ${title}
-      }
-      
-      Create an informative and appealing description focused on the comic's title.
-      Focus on being interesting and inviting.`;
-    }
+    // Create prompt with or without search results
+    const hasSearch = searchInfo.length > 0;
+    const searchContext = hasSearch
+      ? searchInfo
+          .map((info) => `Source: ${info.title}\nInfo: ${info.snippet}`)
+          .join("\n\n")
+      : "";
+
+    let prompt = `Write a ${isLong ? "complete" : "brief"}, engaging description for a comic book.
+
+Constraints:
+- Max length: ${maxChars} characters.
+- No spoilers.
+- Do not invent facts. If details are unknown, keep it general.
+- Keep it readable and inviting.
+
+${isLong ? "Format: 2 short paragraphs. First: hook + premise. Second: tone/genre + what to expect.\n" : "Format: 1–2 sentences.\n"}
+Comic Details:
+Title: ${title}
+Status: ${status}
+${rating > 0 ? `Rating: ${rating}/5` : ""}
+
+${hasSearch ? `Real info (use only if relevant and supported by these snippets):\n\n${searchContext}\n\n` : ""}
+Return only the description text.`;
 
     log("Sending prompt to Gemini");
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    const description = response.text();
+    const description = clampText(response.text(), maxChars);
 
     log("Generated description: " + description);
 
     return res.json({
       success: true,
       description: description,
+      mode: isLong ? "long" : "short",
+      maxChars,
     });
   } catch (err) {
     const errorMessage = err?.message || err;
