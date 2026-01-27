@@ -25,6 +25,39 @@ function clampText(text, maxChars) {
   return cut.trim();
 }
 
+function clampTextWithinRange(text, minChars, maxChars) {
+  const normalized = normalizeWhitespace(text);
+  if (!maxChars) return normalized;
+  if (
+    normalized.length <= maxChars &&
+    (!minChars || normalized.length >= minChars)
+  ) {
+    return normalized;
+  }
+
+  if (normalized.length > maxChars) {
+    const slice = normalized.slice(0, maxChars);
+    const lastBreak = Math.max(
+      slice.lastIndexOf(". "),
+      slice.lastIndexOf("! "),
+      slice.lastIndexOf("? "),
+      slice.lastIndexOf("\n"),
+    );
+
+    const candidate = (
+      lastBreak > 60 ? slice.slice(0, lastBreak + 1) : slice
+    ).trim();
+    // If trimming to a sentence boundary would drop below the minimum, prefer a hard cut.
+    if (minChars && candidate.length < minChars) {
+      return slice.trim();
+    }
+    return candidate;
+  }
+
+  // Too short (caller should expand); return as-is.
+  return normalized;
+}
+
 module.exports = async function ({ req, res, log, error: logError }) {
   // Retrieve and validate secrets and configuration
   const apiKey = process.env.GEMINI_API_KEY;
@@ -123,9 +156,13 @@ module.exports = async function ({ req, res, log, error: logError }) {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    const descriptionMode = String(mode || "short").toLowerCase();
-    const isLong = descriptionMode === "long" || descriptionMode === "full";
-    const maxChars = isLong ? 1200 : 250;
+    const descriptionMode = String(mode || "long").toLowerCase();
+    const isLong =
+      descriptionMode === "long" ||
+      descriptionMode === "full" ||
+      descriptionMode === "detailed";
+    const maxChars = isLong ? 2000 : 280;
+    const minChars = isLong ? 1800 : 0;
 
     // Create prompt with or without search results
     const hasSearch = searchInfo.length > 0;
@@ -135,27 +172,91 @@ module.exports = async function ({ req, res, log, error: logError }) {
           .join("\n\n")
       : "";
 
-    let prompt = `Write a ${isLong ? "complete" : "brief"}, engaging description for a comic book.
+    let prompt = `Write a ${isLong ? "detailed" : "brief"}, engaging description for a comic book.
 
-Constraints:
-- Max length: ${maxChars} characters.
-- No spoilers.
-- Do not invent facts. If details are unknown, keep it general.
-- Keep it readable and inviting.
+  Constraints:
+  - ${isLong ? `Target length: ${minChars}–${maxChars} characters (including spaces). Do not exceed ${maxChars}.` : `Max length: ${maxChars} characters.`}
+  - No spoilers.
+  - Do not invent facts. If details are unknown, keep it general.
+  - Avoid quoting or mentioning sources/search results.
+  - Keep it readable and inviting.
 
-${isLong ? "Format: 2 short paragraphs. First: hook + premise. Second: tone/genre + what to expect.\n" : "Format: 1–2 sentences.\n"}
-Comic Details:
-Title: ${title}
-Status: ${status}
-${rating > 0 ? `Rating: ${rating}/5` : ""}
+  ${isLong ? "Format: 3 short paragraphs.\n- Paragraph 1: hook + premise.\n- Paragraph 2: tone/genre + themes + what makes it compelling.\n- Paragraph 3: what a reader can expect + gentle call-to-read.\n" : "Format: 1–2 sentences.\n"}
+  Comic Details:
+  Title: ${title}
+  Status: ${status}
+  ${rating > 0 ? `Rating: ${rating}/5` : ""}
 
-${hasSearch ? `Real info (use only if relevant and supported by these snippets):\n\n${searchContext}\n\n` : ""}
-Return only the description text.`;
+  ${hasSearch ? `Verified info (use only if relevant and supported by these snippets):\n\n${searchContext}\n\n` : ""}
+  Return only the description text.`;
 
     log("Sending prompt to Gemini");
     const result = await model.generateContent(prompt);
     const response = await result.response;
-    const description = clampText(response.text(), maxChars);
+
+    let description = isLong
+      ? clampTextWithinRange(response.text(), minChars, maxChars)
+      : clampText(response.text(), maxChars);
+
+    if (isLong) {
+      let attempts = 0;
+      while (description.length < minChars && attempts < 4) {
+        attempts += 1;
+        log(
+          `Description too short (${description.length} chars). Expanding (attempt ${attempts})...`,
+        );
+
+        const expandPrompt = `Expand the following comic description to be between ${minChars} and ${maxChars} characters (including spaces).
+
+Rules:
+- Keep the same facts; do not add new factual claims (no new names, events, publishers, creators, dates).
+- You may elaborate only in general terms (tone, atmosphere, stakes, themes, reading experience).
+- No spoilers.
+- Keep 3 short paragraphs.
+- Do not mention sources/search results.
+- Must be at least ${minChars} characters and must not exceed ${maxChars}.
+
+Original description:
+"""
+${description}
+"""`;
+
+        const expandResult = await model.generateContent(expandPrompt);
+        const expandResponse = await expandResult.response;
+        description = clampTextWithinRange(
+          expandResponse.text(),
+          minChars,
+          maxChars,
+        );
+      }
+
+      // Safety: if the model still returned something outside bounds, try one final strict rewrite.
+      if (description.length < minChars || description.length > maxChars) {
+        log(
+          `Description out of bounds (${description.length}). Forcing strict rewrite to ${minChars}-${maxChars}...`,
+        );
+        const strictPrompt = `Rewrite the following into exactly 3 short paragraphs and ensure the result is between ${minChars} and ${maxChars} characters (including spaces).
+
+Rules:
+- No spoilers.
+- Do not invent facts; keep it general where facts are unknown.
+- Do not mention sources/search results.
+- Must be within range.
+
+Input:
+"""
+${description}
+"""`;
+
+        const strictResult = await model.generateContent(strictPrompt);
+        const strictResponse = await strictResult.response;
+        description = clampTextWithinRange(
+          strictResponse.text(),
+          minChars,
+          maxChars,
+        );
+      }
+    }
 
     log("Generated description: " + description);
 
