@@ -61,15 +61,13 @@ function clampTextWithinRange(text, minChars, maxChars) {
 module.exports = async function ({ req, res, log, error: logError }) {
   // Retrieve and validate secrets and configuration
   const apiKey = process.env.GEMINI_API_KEY;
-  const searchApiKey = process.env.GOOGLE_SEARCH_API_KEY;
-  const searchEngineId = process.env.GOOGLE_SEARCH_ENGINE_ID;
+  const searchApiKey = process.env.SERPER_SEARCH_API_KEY;
   const modelName = process.env.GEMINI_MODEL || "gemini-pro";
 
   // Validate environment variables
   const missingVars = [];
   if (!apiKey) missingVars.push("GEMINI_API_KEY");
-  if (!searchApiKey) missingVars.push("GOOGLE_SEARCH_API_KEY");
-  if (!searchEngineId) missingVars.push("GOOGLE_SEARCH_ENGINE_ID");
+  if (!searchApiKey) missingVars.push("SERPER_SEARCH_API_KEY");
 
   if (missingVars.length > 0) {
     const errorMsg = `Missing environment variables: ${missingVars.join(", ")}`;
@@ -82,7 +80,6 @@ module.exports = async function ({ req, res, log, error: logError }) {
 
   // Log configuration (with redacted keys)
   log(`Configuration:
-    Search Engine ID: ${searchEngineId}
     Search API Key: ${searchApiKey.substring(0, 8)}...
     Model Name: ${modelName}
   `);
@@ -110,46 +107,41 @@ module.exports = async function ({ req, res, log, error: logError }) {
   }
 
   try {
-    // First, get comic information from Google Search
+    // First, get comic information from a search provider
     log("Fetching search results for: " + title);
 
-    const searchQuery = encodeURIComponent(title + " comic book");
-    log("Encoded search query: " + searchQuery);
-
-    const searchUrl = `https://customsearch.googleapis.com/customsearch/v1?key=${searchApiKey}&cx=${searchEngineId}&q=${searchQuery}`;
-    log(
-      "Making search request to: " +
-        searchUrl.replace(searchApiKey, "REDACTED"),
-    );
+    const searchQuery = title + " comic book";
+    log("Search query: " + searchQuery);
 
     let searchInfo = [];
+
+    // Use Serper.dev for search
+    const searchUrl = "https://google.serper.dev/search";
+    log(
+      "Making Serper Search request to: " +
+        searchUrl,
+    );
     try {
-      const searchResponse = await axios.get(searchUrl, {
+      const searchResponse = await axios.post(searchUrl, { q: searchQuery }, {
         headers: {
-          Accept: "application/json",
+          "X-API-KEY": searchApiKey,
+          "Content-Type": "application/json",
         },
       });
-
-      if (searchResponse.data && searchResponse.data.items) {
-        searchInfo = searchResponse.data.items.slice(0, 3).map((item) => ({
-          title: item.title,
-          snippet: item.snippet,
-          link: item.link,
+      const d = searchResponse.data || {};
+      if (d.organic && Array.isArray(d.organic)) {
+        searchInfo = d.organic.slice(0, 3).map((item) => ({
+          title: item.title || "",
+          snippet: item.snippet || "",
+          link: item.link || "",
         }));
-        log("Search results found: " + JSON.stringify(searchInfo));
+        log("Serper search results found: " + JSON.stringify(searchInfo));
       } else {
-        log(
-          "No search results found in response: " +
-            JSON.stringify(searchResponse.data),
-        );
+        log("Serper search returned no usable results");
       }
-    } catch (searchError) {
-      const errorDetails = searchError.response?.data || searchError.message;
-      logError(
-        "Google Search API error details: " + JSON.stringify(errorDetails),
-      );
-      // Continue without search results rather than failing completely
-      log("Proceeding without search results due to API error");
+    } catch (e) {
+      const details = e.response?.data || e.message;
+      logError("Serper Search API error details: " + JSON.stringify(details));
     }
 
     // Initialize Gemini AI
