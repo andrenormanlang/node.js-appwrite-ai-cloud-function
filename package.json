@@ -4,7 +4,8 @@
   "description": "Appwrite function to generate comic descriptions using Gemini",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "test-local": "node test-local.js"
   },
   "dependencies": {
     "@google/generative-ai": "^0.8.0",

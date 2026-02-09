@@ -24,7 +24,7 @@ const fn = require("./index.js");
 const req = {
   // The function expects a string body containing JSON
   body: JSON.stringify({
-    title: "Watchmen",
+    title: "Berkserk Vol 43",
     status: "completed",
     rating: 5,
     mode: "long",
