@@ -66,6 +66,35 @@ function clampTitle(title, maxChars = 255) {
   return normalized.slice(0, maxChars).trim();
 }
 
+function clampIssueNumber(issueNumber, maxChars = 32) {
+  const normalized = normalizeWhitespace(issueNumber)
+    .replace(/^["'`\s]+|["'`\s]+$/g, "")
+    .trim();
+
+  if (!normalized) return "";
+  return normalized.slice(0, maxChars).trim();
+}
+
+function combineTitleAndIssue(title, issueNumber) {
+  const normalizedTitle = clampTitle(title);
+  const normalizedIssue = clampIssueNumber(issueNumber);
+
+  if (!normalizedTitle) return "";
+  if (!normalizedIssue) return normalizedTitle;
+
+  const titleLower = normalizedTitle.toLowerCase();
+  const issueLower = normalizedIssue.toLowerCase();
+  if (titleLower.includes(issueLower)) {
+    return normalizedTitle;
+  }
+
+  const formattedIssue = /^#|^vol\.?\s*\d+/i.test(normalizedIssue)
+    ? normalizedIssue
+    : `#${normalizedIssue}`;
+
+  return clampTitle(`${normalizedTitle} ${formattedIssue}`);
+}
+
 function parseStructuredJson(text) {
   const raw = String(text || "").trim();
   if (!raw) {
@@ -177,11 +206,13 @@ Constraints:
 - ${isLong ? `Target length: ${minChars}-${maxChars} characters (including spaces).` : `Max length: ${maxChars} characters.`}
 - Focus on what is visibly present on the cover: characters, costumes, action, mood, color palette, setting, art style, and any clearly legible title text.
 - Identify the main comic title from the cover text when it is clearly legible.
+- Identify the issue number, volume number, or issue marker when it is clearly legible.
 - If a title is provided, use it only when it matches the visible cover and do not invent issue numbers, creators, publishers, or story details.
 - Do not add spoilers, plot summaries, or facts that are not visually supported.
 - Write in a polished, reader-friendly tone.
 - Avoid phrases like "the image shows" or "the cover features."
 - If the title is not readable, return an empty string for "title".
+- If the issue number is not readable, return an empty string for "issueNumber".
 
 ${isLong ? 'Format the "description" as 2 short paragraphs.' : 'Format the "description" as 1-2 sentences.'}
 Comic metadata:
@@ -192,6 +223,7 @@ ${rating > 0 ? `Reader rating: ${rating}/5` : ""}
 Return strict JSON only in this shape:
 {
   "title": "string",
+  "issueNumber": "string",
   "description": "string"
 }`;
 }
@@ -216,6 +248,7 @@ function buildTextPrompt({
 
 Constraints:
 - ${isLong ? `Target length: ${minChars}-${maxChars} characters (including spaces). Do not exceed ${maxChars}.` : `Max length: ${maxChars} characters.`}
+- Use the exact comic title provided, including the issue number when present, so the description matches that specific issue rather than the series in general.
 - No spoilers.
 - Do not invent facts. If details are unknown, keep it general.
 - Avoid quoting or mentioning sources/search results.
@@ -368,7 +401,10 @@ async function generateFromImage({
   ]);
   const response = await result.response;
   const parsed = parseStructuredJson(response.text());
-  const extractedTitle = clampTitle(parsed?.title || title || "");
+  const extractedTitle = combineTitleAndIssue(
+    parsed?.title || title || "",
+    parsed?.issueNumber || "",
+  );
   let description = isLong
     ? clampTextWithinRange(parsed?.description || "", minChars, maxChars)
     : clampText(parsed?.description || "", maxChars);
