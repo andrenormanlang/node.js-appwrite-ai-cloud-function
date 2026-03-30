@@ -56,6 +56,34 @@ function clampTextWithinRange(text, minChars, maxChars) {
   return normalized;
 }
 
+function clampTitle(title, maxChars = 255) {
+  const normalized = normalizeWhitespace(title)
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .replace(/\s+[|:-]\s+(marvel|dc|image|dark horse|boom!|idw).*$/i, "")
+    .trim();
+
+  if (!normalized) return "";
+  return normalized.slice(0, maxChars).trim();
+}
+
+function parseStructuredJson(text) {
+  const raw = String(text || "").trim();
+  if (!raw) {
+    throw new Error("Model returned empty content");
+  }
+
+  const fencedMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/i);
+  const candidate = fencedMatch ? fencedMatch[1].trim() : raw;
+  const start = candidate.indexOf("{");
+  const end = candidate.lastIndexOf("}");
+  const jsonText =
+    start !== -1 && end !== -1 && end > start
+      ? candidate.slice(start, end + 1)
+      : candidate;
+
+  return JSON.parse(jsonText);
+}
+
 function getMimeTypeFromResponse(response) {
   const header = String(response?.headers?.["content-type"] || "").toLowerCase();
   if (header.startsWith("image/")) {
@@ -126,39 +154,37 @@ function getDescriptionLimits(mode, useImage) {
     descriptionMode === "full" ||
     descriptionMode === "detailed";
 
-  if (useImage) {
-    return {
-      isLong,
-      minChars: isLong ? 220 : 0,
-      maxChars: isLong ? 900 : 280,
-    };
-  }
-
   return {
     isLong,
     minChars: isLong ? 600 : 0,
-    maxChars: isLong ? 750 : 280,
+    maxChars: isLong ? 800 : 280,
   };
 }
 
 function buildImagePrompt({ title, status, rating, isLong, minChars, maxChars }) {
-  return `Describe this comic book cover for a comic shelf app.
+  return `Analyze this comic book cover for a comic shelf app and return JSON.
 
 Constraints:
 - ${isLong ? `Target length: ${minChars}-${maxChars} characters (including spaces).` : `Max length: ${maxChars} characters.`}
 - Focus on what is visibly present on the cover: characters, costumes, action, mood, color palette, setting, art style, and any clearly legible title text.
-- If a title is provided, use it only when it fits the visible cover and do not invent issue numbers, creators, publishers, or story details.
+- Identify the main comic title from the cover text when it is clearly legible.
+- If a title is provided, use it only when it matches the visible cover and do not invent issue numbers, creators, publishers, or story details.
 - Do not add spoilers, plot summaries, or facts that are not visually supported.
 - Write in a polished, reader-friendly tone.
 - Avoid phrases like "the image shows" or "the cover features."
+- If the title is not readable, return an empty string for "title".
 
-${isLong ? "Format: 2 short paragraphs." : "Format: 1-2 sentences."}
+${isLong ? 'Format the "description" as 2 short paragraphs.' : 'Format the "description" as 1-2 sentences.'}
 Comic metadata:
 Title: ${title || "Unknown"}
 Status: ${status || "Unknown"}
 ${rating > 0 ? `Reader rating: ${rating}/5` : ""}
 
-Return only the description text.`;
+Return strict JSON only in this shape:
+{
+  "title": "string",
+  "description": "string"
+}`;
 }
 
 function buildTextPrompt({
@@ -226,7 +252,13 @@ async function generateFromText({
     : clampText(response.text(), maxChars);
 
   if (!isLong) {
-    return { description, mode: "short", maxChars, source: "title" };
+    return {
+      title: clampTitle(title),
+      description,
+      mode: "short",
+      maxChars,
+      source: "title",
+    };
   }
 
   let attempts = 0;
@@ -287,7 +319,13 @@ ${description}
     );
   }
 
-  return { description, mode: "long", maxChars, source: "title" };
+  return {
+    title: clampTitle(title),
+    description,
+    mode: "long",
+    maxChars,
+    source: "title",
+  };
 }
 
 async function generateFromImage({
@@ -320,13 +358,20 @@ async function generateFromImage({
     },
   ]);
   const response = await result.response;
-
+  const parsed = parseStructuredJson(response.text());
+  const extractedTitle = clampTitle(parsed?.title || title || "");
   let description = isLong
-    ? clampTextWithinRange(response.text(), minChars, maxChars)
-    : clampText(response.text(), maxChars);
+    ? clampTextWithinRange(parsed?.description || "", minChars, maxChars)
+    : clampText(parsed?.description || "", maxChars);
 
   if (!isLong) {
-    return { description, mode: "short", maxChars, source: "cover-image" };
+    return {
+      title: extractedTitle,
+      description,
+      mode: "short",
+      maxChars,
+      source: "cover-image",
+    };
   }
 
   if (description.length < minChars) {
@@ -356,7 +401,40 @@ ${description}
     );
   }
 
-  return { description, mode: "long", maxChars, source: "cover-image" };
+  if (description.length < minChars || description.length > maxChars) {
+    log(
+      `Image description out of bounds (${description.length}). Forcing strict rewrite to ${minChars}-${maxChars}...`,
+    );
+
+    const strictPrompt = `Rewrite the following comic cover description so the result is between ${minChars} and ${maxChars} characters (including spaces).
+
+Rules:
+- Keep it to 2 short paragraphs.
+- Do not invent issue numbers, creators, publishers, or plot details.
+- Only describe what is visually supported by the cover.
+- Avoid phrases like "the image shows."
+
+Input:
+"""
+${description}
+"""`;
+
+    const strictResult = await model.generateContent(strictPrompt);
+    const strictResponse = await strictResult.response;
+    description = clampTextWithinRange(
+      strictResponse.text(),
+      minChars,
+      maxChars,
+    );
+  }
+
+  return {
+    title: extractedTitle,
+    description,
+    mode: "long",
+    maxChars,
+    source: "cover-image",
+  };
 }
 
 module.exports = async function ({ req, res, log, error: logError }) {
@@ -459,6 +537,7 @@ module.exports = async function ({ req, res, log, error: logError }) {
 
     return res.json({
       success: true,
+      title: result.title || clampTitle(normalizedTitle),
       description: result.description,
       mode: result.mode,
       maxChars: result.maxChars,
