@@ -200,21 +200,15 @@ function buildImagePrompt({
   minChars,
   maxChars,
 }) {
-  return `Analyze this comic book cover for a comic shelf app and return JSON.
+  return `Analyze this comic book cover and return only the comic identification details as JSON.
 
 Constraints:
-- ${isLong ? `Target length: ${minChars}-${maxChars} characters (including spaces).` : `Max length: ${maxChars} characters.`}
-- Focus on what is visibly present on the cover: characters, costumes, action, mood, color palette, setting, art style, and any clearly legible title text.
 - Identify the main comic title from the cover text when it is clearly legible.
 - Identify the issue number, volume number, or issue marker when it is clearly legible.
 - If a title is provided, use it only when it matches the visible cover and do not invent issue numbers, creators, publishers, or story details.
-- Do not add spoilers, plot summaries, or facts that are not visually supported.
-- Write in a polished, reader-friendly tone.
-- Avoid phrases like "the image shows" or "the cover features."
 - If the title is not readable, return an empty string for "title".
 - If the issue number is not readable, return an empty string for "issueNumber".
 
-${isLong ? 'Format the "description" as 2 short paragraphs.' : 'Format the "description" as 1-2 sentences.'}
 Comic metadata:
 Title: ${title || "Unknown"}
 Status: ${status || "Unknown"}
@@ -223,8 +217,7 @@ ${rating > 0 ? `Reader rating: ${rating}/5` : ""}
 Return strict JSON only in this shape:
 {
   "title": "string",
-  "issueNumber": "string",
-  "description": "string"
+  "issueNumber": "string"
 }`;
 }
 
@@ -370,24 +363,21 @@ ${description}
   };
 }
 
-async function generateFromImage({
+async function extractTitleFromImage({
   model,
   imageUrl,
   title,
   status,
   rating,
-  mode,
-  log,
 }) {
   const { data, mimeType } = await fetchImageAsInlineData(imageUrl);
-  const { isLong, minChars, maxChars } = getDescriptionLimits(mode, true);
   const prompt = buildImagePrompt({
     title,
     status,
     rating,
-    isLong,
-    minChars,
-    maxChars,
+    isLong: true,
+    minChars: 600,
+    maxChars: 800,
   });
 
   const result = await model.generateContent([
@@ -401,85 +391,10 @@ async function generateFromImage({
   ]);
   const response = await result.response;
   const parsed = parseStructuredJson(response.text());
-  const extractedTitle = combineTitleAndIssue(
+  return combineTitleAndIssue(
     parsed?.title || title || "",
     parsed?.issueNumber || "",
   );
-  let description = isLong
-    ? clampTextWithinRange(parsed?.description || "", minChars, maxChars)
-    : clampText(parsed?.description || "", maxChars);
-
-  if (!isLong) {
-    return {
-      title: extractedTitle,
-      description,
-      mode: "short",
-      maxChars,
-      source: "cover-image",
-    };
-  }
-
-  if (description.length < minChars) {
-    log(
-      `Image description came back short (${description.length} chars). Expanding without adding facts...`,
-    );
-
-    const expandPrompt = `Expand the following comic cover description to between ${minChars} and ${maxChars} characters.
-
-Rules:
-- Only elaborate on visible visual elements, mood, style, and genre cues already implied by the description.
-- Do not invent issue numbers, publishers, creators, or plot details.
-- Keep it to 2 short paragraphs.
-- Avoid phrases like "the image shows."
-
-Original description:
-"""
-${description}
-"""`;
-
-    const expandResult = await model.generateContent(expandPrompt);
-    const expandResponse = await expandResult.response;
-    description = clampTextWithinRange(
-      expandResponse.text(),
-      minChars,
-      maxChars,
-    );
-  }
-
-  if (description.length < minChars || description.length > maxChars) {
-    log(
-      `Image description out of bounds (${description.length}). Forcing strict rewrite to ${minChars}-${maxChars}...`,
-    );
-
-    const strictPrompt = `Rewrite the following comic cover description so the result is between ${minChars} and ${maxChars} characters (including spaces).
-
-Rules:
-- Keep it to 2 short paragraphs.
-- Do not invent issue numbers, creators, publishers, or plot details.
-- Only describe what is visually supported by the cover.
-- Avoid phrases like "the image shows."
-
-Input:
-"""
-${description}
-"""`;
-
-    const strictResult = await model.generateContent(strictPrompt);
-    const strictResponse = await strictResult.response;
-    description = clampTextWithinRange(
-      strictResponse.text(),
-      minChars,
-      maxChars,
-    );
-  }
-
-  return {
-    title: extractedTitle,
-    description,
-    mode: "long",
-    maxChars,
-    source: "cover-image",
-  };
 }
 
 module.exports = async function ({ req, res, log, error: logError }) {
@@ -539,22 +454,25 @@ module.exports = async function ({ req, res, log, error: logError }) {
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: modelName });
 
-    let result;
+    let resolvedTitle = normalizedTitle;
     if (normalizedImageUrl) {
       try {
-        log("Generating description from cover image...");
-        result = await generateFromImage({
+        log("Extracting title and issue number from cover image...");
+        const extractedTitle = await extractTitleFromImage({
           model,
           imageUrl: normalizedImageUrl,
           title: normalizedTitle,
           status: normalizedStatus,
           rating: numericRating,
-          mode,
-          log,
         });
+
+        if (extractedTitle) {
+          resolvedTitle = extractedTitle;
+          log(`Resolved title from cover image: ${resolvedTitle}`);
+        }
       } catch (imageError) {
         logError(
-          `Image-based generation failed: ${imageError.message || imageError}`,
+          `Image-based title extraction failed: ${imageError.message || imageError}`,
         );
 
         if (!normalizedTitle) {
@@ -565,28 +483,30 @@ module.exports = async function ({ req, res, log, error: logError }) {
       }
     }
 
-    if (!result) {
-      result = await generateFromText({
-        model,
-        title: normalizedTitle,
-        status: normalizedStatus,
-        rating: numericRating,
-        mode,
-        searchApiKey,
-        log,
-        logError,
-      });
+    if (!resolvedTitle) {
+      throw new Error("Could not determine a comic title from the provided cover");
     }
+
+    const result = await generateFromText({
+      model,
+      title: resolvedTitle,
+      status: normalizedStatus,
+      rating: numericRating,
+      mode,
+      searchApiKey,
+      log,
+      logError,
+    });
 
     log("Generated description: " + result.description);
 
     return res.json({
       success: true,
-      title: result.title || clampTitle(normalizedTitle),
+      title: result.title || clampTitle(resolvedTitle),
       description: result.description,
       mode: result.mode,
       maxChars: result.maxChars,
-      source: result.source,
+      source: normalizedImageUrl ? "title-via-cover" : result.source,
     });
   } catch (err) {
     const errorMessage = err?.message || String(err);
