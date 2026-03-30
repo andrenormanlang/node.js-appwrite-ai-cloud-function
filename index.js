@@ -449,7 +449,7 @@ ${description}
 module.exports = async function ({ req, res, log, error: logError }) {
   const apiKey = process.env.GEMINI_API_KEY;
   const searchApiKey = process.env.SERPER_SEARCH_API_KEY;
-  const modelName = process.env.GEMINI_MODEL || "gemini-1.5-pro";
+  const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
   if (!apiKey) {
     const errorMsg = "Missing environment variables: GEMINI_API_KEY";
