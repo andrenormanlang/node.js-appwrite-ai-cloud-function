@@ -1,12 +1,13 @@
 # 🦸‍♂️ Comics AI Description Generator
 
-An Appwrite Cloud Function that automatically generates engaging descriptions for your comic books using Google's Gemini AI and SERPER web search data! 🚀
+An Appwrite Cloud Function that automatically generates engaging descriptions for your comic books using Gemini. It prefers analyzing the uploaded comic cover image when one is available, and falls back to title-based generation with optional SERPER search enrichment. 🚀
 
 ## 🎯 Features
 
-- 🤖 Uses Gemini AI for creative and contextual descriptions
-- 🔍 Incorporates real-world information via SERPER (Serper.dev)
-- ⚡ Complete and broad descriptions up to 2000 characters
+- 🤖 Uses Gemini AI for cover-aware and contextual descriptions
+- 🖼️ Can analyze a comic cover image URL directly
+- 🔍 Optionally incorporates real-world information via SERPER (Serper.dev) for title-only generation
+- ⚡ Complete and broad descriptions up to 2000 characters for title-based mode
 - 📚 Works with any comic book title
 
 ## 🛠️ Setup
@@ -14,7 +15,7 @@ An Appwrite Cloud Function that automatically generates engaging descriptions fo
 ### Prerequisites
 
 - 🔑 Google Gemini API Key
-- 🔎 SERPER Search API Key (set as `SERPER_SEARCH_API_KEY`)
+- 🔎 SERPER Search API Key (optional, set as `SERPER_SEARCH_API_KEY`)
 - ☁️ Appwrite Account
 
 ### Environment Variables
@@ -25,7 +26,7 @@ Set these in your Appwrite Console under Functions > comics_ai_description > Var
 GEMINI_API_KEY=your_gemini_api_key
 SERPER_SEARCH_API_KEY=your_serper_search_api_key
 # Optional: specify a Gemini model (defaults to gemini-pro)
-GEMINI_MODEL=gemini-pro
+GEMINI_MODEL=gemini-1.5-flash
 ```
 
 ## 🚀 Usage
@@ -35,17 +36,19 @@ The function expects a JSON payload with the following structure:
 ```json
 {
   "title": "Comic Title",
-  "status": "published",
+  "status": "to-read",
   "rating": 4,
+  "coverImage": "https://res.cloudinary.com/your-cloud/image/upload/sample.jpg",
   "mode": "long"
 }
 ```
 
 Fields:
 
-- `title` (string, required)
-- `status` (string, required) — e.g., "published", "draft"
+- `title` (string, optional if `coverImage` is provided)
+- `status` (string, required) — e.g., "to-read", "read"
 - `rating` (number, optional) — 0–5
+- `coverImage` (string, optional) — public image URL for the comic cover
 - `mode` (string, optional) — "short" or "long" (default: "long")
 
 ### Response Format
@@ -55,7 +58,8 @@ Fields:
   "success": true,
   "description": "Generated description for your comic",
   "mode": "long",
-  "maxChars": 2000
+  "maxChars": 900,
+  "source": "cover-image"
 }
 ```
 
@@ -93,6 +97,7 @@ Output:
 The function includes robust error handling for:
 
 - 🔒 Missing API keys
+- 🌐 Cover image download failures (with title fallback when possible)
 - 📡 Failed search requests (SERPER errors are logged; the function will continue)
 - 🤖 AI generation issues
 - 📄 Invalid input data

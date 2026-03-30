@@ -132,7 +132,7 @@
       ],
       "scopes": ["users.read"],
       "schedule": "",
-      "timeout": 15,
+      "timeout": 30,
       "enabled": true,
       "logging": true,
       "entrypoint": "index.js",

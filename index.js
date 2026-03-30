@@ -47,158 +47,196 @@ function clampTextWithinRange(text, minChars, maxChars) {
     const candidate = (
       lastBreak > 60 ? slice.slice(0, lastBreak + 1) : slice
     ).trim();
-    // If trimming to a sentence boundary would drop below the minimum, prefer a hard cut.
     if (minChars && candidate.length < minChars) {
       return slice.trim();
     }
     return candidate;
   }
 
-  // Too short (caller should expand); return as-is.
   return normalized;
 }
 
-module.exports = async function ({ req, res, log, error: logError }) {
-  // Retrieve and validate secrets and configuration
-  const apiKey = process.env.GEMINI_API_KEY;
-  const searchApiKey = process.env.SERPER_SEARCH_API_KEY;
-  const modelName = process.env.GEMINI_MODEL || "gemini-pro";
-
-  // Validate environment variables
-  const missingVars = [];
-  if (!apiKey) missingVars.push("GEMINI_API_KEY");
-  if (!searchApiKey) missingVars.push("SERPER_SEARCH_API_KEY");
-
-  if (missingVars.length > 0) {
-    const errorMsg = `Missing environment variables: ${missingVars.join(", ")}`;
-    logError(errorMsg);
-    return res.json({
-      success: false,
-      error: errorMsg,
-    });
+function getMimeTypeFromResponse(response) {
+  const header = String(response?.headers?.["content-type"] || "").toLowerCase();
+  if (header.startsWith("image/")) {
+    return header.split(";")[0];
   }
 
-  // Log configuration (with redacted keys)
-  log(`Configuration:
-    Search API Key: ${searchApiKey.substring(0, 8)}...
-    Model Name: ${modelName}
-  `);
+  return "image/jpeg";
+}
 
-  let payload;
-  try {
-    payload = JSON.parse(req.body);
-    log("Received payload: " + JSON.stringify(payload));
-  } catch (e) {
-    logError("Failed to parse request payload: " + e.message);
-    return res.json({
-      success: false,
-      error: "Invalid request format",
-    });
+async function fetchImageAsInlineData(imageUrl) {
+  const response = await axios.get(imageUrl, {
+    responseType: "arraybuffer",
+    timeout: 20000,
+    maxContentLength: 15 * 1024 * 1024,
+    maxBodyLength: 15 * 1024 * 1024,
+  });
+
+  return {
+    data: Buffer.from(response.data).toString("base64"),
+    mimeType: getMimeTypeFromResponse(response),
+  };
+}
+
+async function fetchSearchInfo(searchApiKey, title, log, logError) {
+  if (!searchApiKey) {
+    log("SERPER_SEARCH_API_KEY not configured. Skipping search enrichment.");
+    return [];
   }
 
-  const { title, status, rating, mode } = payload;
-
-  if (!title || !status) {
-    logError("Missing required fields: title or status");
-    return res.json({
-      success: false,
-      error: "Missing required fields: title, status.",
-    });
-  }
+  const searchQuery = `${title} comic book`;
+  const searchUrl = "https://google.serper.dev/search";
+  log(`Searching for supporting comic info: ${searchQuery}`);
 
   try {
-    // First, get comic information from a search provider
-    log("Fetching search results for: " + title);
-
-    const searchQuery = title + " comic book";
-    log("Search query: " + searchQuery);
-
-    let searchInfo = [];
-
-    // Use Serper.dev for search
-    const searchUrl = "https://google.serper.dev/search";
-    log(
-      "Making Serper Search request to: " +
-        searchUrl,
-    );
-    try {
-      const searchResponse = await axios.post(searchUrl, { q: searchQuery }, {
+    const searchResponse = await axios.post(
+      searchUrl,
+      { q: searchQuery },
+      {
         headers: {
           "X-API-KEY": searchApiKey,
           "Content-Type": "application/json",
         },
-      });
-      const d = searchResponse.data || {};
-      if (d.organic && Array.isArray(d.organic)) {
-        searchInfo = d.organic.slice(0, 3).map((item) => ({
-          title: item.title || "",
-          snippet: item.snippet || "",
-          link: item.link || "",
-        }));
-        log("Serper search results found: " + JSON.stringify(searchInfo));
-      } else {
-        log("Serper search returned no usable results");
-      }
-    } catch (e) {
-      const details = e.response?.data || e.message;
-      logError("Serper Search API error details: " + JSON.stringify(details));
+        timeout: 12000,
+      },
+    );
+
+    const data = searchResponse.data || {};
+    if (!Array.isArray(data.organic)) {
+      return [];
     }
 
-    // Initialize Gemini AI
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({ model: modelName });
+    return data.organic.slice(0, 3).map((item) => ({
+      title: item.title || "",
+      snippet: item.snippet || "",
+      link: item.link || "",
+    }));
+  } catch (err) {
+    const details = err.response?.data || err.message;
+    logError("Serper Search API error details: " + JSON.stringify(details));
+    return [];
+  }
+}
 
-    const descriptionMode = String(mode || "long").toLowerCase();
-    const isLong =
-      descriptionMode === "long" ||
-      descriptionMode === "full" ||
-      descriptionMode === "detailed";
-    const maxChars = isLong ? 2000 : 280;
-    const minChars = isLong ? 1800 : 0;
+function getDescriptionLimits(mode, useImage) {
+  const descriptionMode = String(mode || "long").toLowerCase();
+  const isLong =
+    descriptionMode === "long" ||
+    descriptionMode === "full" ||
+    descriptionMode === "detailed";
 
-    // Create prompt with or without search results
-    const hasSearch = searchInfo.length > 0;
-    const searchContext = hasSearch
-      ? searchInfo
-          .map((info) => `Source: ${info.title}\nInfo: ${info.snippet}`)
-          .join("\n\n")
-      : "";
+  if (useImage) {
+    return {
+      isLong,
+      minChars: isLong ? 220 : 0,
+      maxChars: isLong ? 900 : 280,
+    };
+  }
 
-    let prompt = `Write a ${isLong ? "detailed" : "brief"}, engaging description for a comic book.
+  return {
+    isLong,
+    minChars: isLong ? 600 : 0,
+    maxChars: isLong ? 750 : 280,
+  };
+}
 
-  Constraints:
-  - ${isLong ? `Target length: ${minChars}–${maxChars} characters (including spaces). Do not exceed ${maxChars}.` : `Max length: ${maxChars} characters.`}
-  - No spoilers.
-  - Do not invent facts. If details are unknown, keep it general.
-  - Avoid quoting or mentioning sources/search results.
-  - Keep it readable and inviting.
+function buildImagePrompt({ title, status, rating, isLong, minChars, maxChars }) {
+  return `Describe this comic book cover for a comic shelf app.
 
-  ${isLong ? "Format: 3 short paragraphs.\n- Paragraph 1: hook + premise.\n- Paragraph 2: tone/genre + themes + what makes it compelling.\n- Paragraph 3: what a reader can expect + gentle call-to-read.\n" : "Format: 1–2 sentences.\n"}
-  Comic Details:
-  Title: ${title}
-  Status: ${status}
-  ${rating > 0 ? `Rating: ${rating}/5` : ""}
+Constraints:
+- ${isLong ? `Target length: ${minChars}-${maxChars} characters (including spaces).` : `Max length: ${maxChars} characters.`}
+- Focus on what is visibly present on the cover: characters, costumes, action, mood, color palette, setting, art style, and any clearly legible title text.
+- If a title is provided, use it only when it fits the visible cover and do not invent issue numbers, creators, publishers, or story details.
+- Do not add spoilers, plot summaries, or facts that are not visually supported.
+- Write in a polished, reader-friendly tone.
+- Avoid phrases like "the image shows" or "the cover features."
 
-  ${hasSearch ? `Verified info (use only if relevant and supported by these snippets):\n\n${searchContext}\n\n` : ""}
-  Return only the description text.`;
+${isLong ? "Format: 2 short paragraphs." : "Format: 1-2 sentences."}
+Comic metadata:
+Title: ${title || "Unknown"}
+Status: ${status || "Unknown"}
+${rating > 0 ? `Reader rating: ${rating}/5` : ""}
 
-    log("Sending prompt to Gemini");
-    const result = await model.generateContent(prompt);
-    const response = await result.response;
+Return only the description text.`;
+}
 
-    let description = isLong
-      ? clampTextWithinRange(response.text(), minChars, maxChars)
-      : clampText(response.text(), maxChars);
+function buildTextPrompt({
+  title,
+  status,
+  rating,
+  isLong,
+  minChars,
+  maxChars,
+  searchInfo,
+}) {
+  const hasSearch = searchInfo.length > 0;
+  const searchContext = hasSearch
+    ? searchInfo
+        .map((info) => `Source: ${info.title}\nInfo: ${info.snippet}`)
+        .join("\n\n")
+    : "";
 
-    if (isLong) {
-      let attempts = 0;
-      while (description.length < minChars && attempts < 4) {
-        attempts += 1;
-        log(
-          `Description too short (${description.length} chars). Expanding (attempt ${attempts})...`,
-        );
+  return `Write a ${isLong ? "detailed" : "brief"}, engaging description for a comic book.
 
-        const expandPrompt = `Expand the following comic description to be between ${minChars} and ${maxChars} characters (including spaces).
+Constraints:
+- ${isLong ? `Target length: ${minChars}-${maxChars} characters (including spaces). Do not exceed ${maxChars}.` : `Max length: ${maxChars} characters.`}
+- No spoilers.
+- Do not invent facts. If details are unknown, keep it general.
+- Avoid quoting or mentioning sources/search results.
+- Keep it readable and inviting.
+
+${isLong ? "Format: 3 short paragraphs.\n- Paragraph 1: hook + premise.\n- Paragraph 2: tone/genre + themes + what makes it compelling.\n- Paragraph 3: what a reader can expect + gentle call-to-read.\n" : "Format: 1-2 sentences.\n"}
+Comic Details:
+Title: ${title}
+Status: ${status}
+${rating > 0 ? `Rating: ${rating}/5` : ""}
+
+${hasSearch ? `Verified info (use only if relevant and supported by these snippets):\n\n${searchContext}\n\n` : ""}
+Return only the description text.`;
+}
+
+async function generateFromText({
+  model,
+  title,
+  status,
+  rating,
+  mode,
+  searchApiKey,
+  log,
+  logError,
+}) {
+  const searchInfo = await fetchSearchInfo(searchApiKey, title, log, logError);
+  const { isLong, minChars, maxChars } = getDescriptionLimits(mode, false);
+  const prompt = buildTextPrompt({
+    title,
+    status,
+    rating,
+    isLong,
+    minChars,
+    maxChars,
+    searchInfo,
+  });
+
+  const result = await model.generateContent(prompt);
+  const response = await result.response;
+
+  let description = isLong
+    ? clampTextWithinRange(response.text(), minChars, maxChars)
+    : clampText(response.text(), maxChars);
+
+  if (!isLong) {
+    return { description, mode: "short", maxChars, source: "title" };
+  }
+
+  let attempts = 0;
+  while (description.length < minChars && attempts < 4) {
+    attempts += 1;
+    log(
+      `Text description too short (${description.length} chars). Expanding (attempt ${attempts})...`,
+    );
+
+    const expandPrompt = `Expand the following comic description to be between ${minChars} and ${maxChars} characters (including spaces).
 
 Rules:
 - Keep the same facts; do not add new factual claims (no new names, events, publishers, creators, dates).
@@ -213,21 +251,21 @@ Original description:
 ${description}
 """`;
 
-        const expandResult = await model.generateContent(expandPrompt);
-        const expandResponse = await expandResult.response;
-        description = clampTextWithinRange(
-          expandResponse.text(),
-          minChars,
-          maxChars,
-        );
-      }
+    const expandResult = await model.generateContent(expandPrompt);
+    const expandResponse = await expandResult.response;
+    description = clampTextWithinRange(
+      expandResponse.text(),
+      minChars,
+      maxChars,
+    );
+  }
 
-      // Safety: if the model still returned something outside bounds, try one final strict rewrite.
-      if (description.length < minChars || description.length > maxChars) {
-        log(
-          `Description out of bounds (${description.length}). Forcing strict rewrite to ${minChars}-${maxChars}...`,
-        );
-        const strictPrompt = `Rewrite the following into exactly 3 short paragraphs and ensure the result is between ${minChars} and ${maxChars} characters (including spaces).
+  if (description.length < minChars || description.length > maxChars) {
+    log(
+      `Text description out of bounds (${description.length}). Forcing strict rewrite to ${minChars}-${maxChars}...`,
+    );
+
+    const strictPrompt = `Rewrite the following into exactly 3 short paragraphs and ensure the result is between ${minChars} and ${maxChars} characters (including spaces).
 
 Rules:
 - No spoilers.
@@ -240,28 +278,196 @@ Input:
 ${description}
 """`;
 
-        const strictResult = await model.generateContent(strictPrompt);
-        const strictResponse = await strictResult.response;
-        description = clampTextWithinRange(
-          strictResponse.text(),
-          minChars,
-          maxChars,
+    const strictResult = await model.generateContent(strictPrompt);
+    const strictResponse = await strictResult.response;
+    description = clampTextWithinRange(
+      strictResponse.text(),
+      minChars,
+      maxChars,
+    );
+  }
+
+  return { description, mode: "long", maxChars, source: "title" };
+}
+
+async function generateFromImage({
+  model,
+  imageUrl,
+  title,
+  status,
+  rating,
+  mode,
+  log,
+}) {
+  const { data, mimeType } = await fetchImageAsInlineData(imageUrl);
+  const { isLong, minChars, maxChars } = getDescriptionLimits(mode, true);
+  const prompt = buildImagePrompt({
+    title,
+    status,
+    rating,
+    isLong,
+    minChars,
+    maxChars,
+  });
+
+  const result = await model.generateContent([
+    prompt,
+    {
+      inlineData: {
+        mimeType,
+        data,
+      },
+    },
+  ]);
+  const response = await result.response;
+
+  let description = isLong
+    ? clampTextWithinRange(response.text(), minChars, maxChars)
+    : clampText(response.text(), maxChars);
+
+  if (!isLong) {
+    return { description, mode: "short", maxChars, source: "cover-image" };
+  }
+
+  if (description.length < minChars) {
+    log(
+      `Image description came back short (${description.length} chars). Expanding without adding facts...`,
+    );
+
+    const expandPrompt = `Expand the following comic cover description to between ${minChars} and ${maxChars} characters.
+
+Rules:
+- Only elaborate on visible visual elements, mood, style, and genre cues already implied by the description.
+- Do not invent issue numbers, publishers, creators, or plot details.
+- Keep it to 2 short paragraphs.
+- Avoid phrases like "the image shows."
+
+Original description:
+"""
+${description}
+"""`;
+
+    const expandResult = await model.generateContent(expandPrompt);
+    const expandResponse = await expandResult.response;
+    description = clampTextWithinRange(
+      expandResponse.text(),
+      minChars,
+      maxChars,
+    );
+  }
+
+  return { description, mode: "long", maxChars, source: "cover-image" };
+}
+
+module.exports = async function ({ req, res, log, error: logError }) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  const searchApiKey = process.env.SERPER_SEARCH_API_KEY;
+  const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+
+  if (!apiKey) {
+    const errorMsg = "Missing environment variables: GEMINI_API_KEY";
+    logError(errorMsg);
+    return res.json({
+      success: false,
+      error: errorMsg,
+    });
+  }
+
+  log(`Configuration:
+    Search API Key: ${searchApiKey ? `${searchApiKey.substring(0, 8)}...` : "not set"}
+    Model Name: ${modelName}
+  `);
+
+  let payload;
+  try {
+    payload = JSON.parse(req.body || "{}");
+    log("Received payload: " + JSON.stringify(payload));
+  } catch (err) {
+    logError("Failed to parse request payload: " + err.message);
+    return res.json({
+      success: false,
+      error: "Invalid request format",
+    });
+  }
+
+  const { title, status, rating, mode, coverImage, imageUrl } = payload;
+  const normalizedTitle = String(title || "").trim();
+  const normalizedStatus = String(status || "").trim();
+  const normalizedImageUrl = String(coverImage || imageUrl || "").trim();
+  const numericRating = parseInt(rating, 10) || 0;
+
+  if (!normalizedTitle && !normalizedImageUrl) {
+    logError("Missing required fields: provide title and/or cover image URL");
+    return res.json({
+      success: false,
+      error: "Missing required fields: provide title and/or cover image URL.",
+    });
+  }
+
+  if (!normalizedStatus) {
+    logError("Missing required field: status");
+    return res.json({
+      success: false,
+      error: "Missing required field: status.",
+    });
+  }
+
+  try {
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({ model: modelName });
+
+    let result;
+    if (normalizedImageUrl) {
+      try {
+        log("Generating description from cover image...");
+        result = await generateFromImage({
+          model,
+          imageUrl: normalizedImageUrl,
+          title: normalizedTitle,
+          status: normalizedStatus,
+          rating: numericRating,
+          mode,
+          log,
+        });
+      } catch (imageError) {
+        logError(
+          `Image-based generation failed: ${imageError.message || imageError}`,
         );
+
+        if (!normalizedTitle) {
+          throw imageError;
+        }
+
+        log("Falling back to title-based generation.");
       }
     }
 
-    log("Generated description: " + description);
+    if (!result) {
+      result = await generateFromText({
+        model,
+        title: normalizedTitle,
+        status: normalizedStatus,
+        rating: numericRating,
+        mode,
+        searchApiKey,
+        log,
+        logError,
+      });
+    }
+
+    log("Generated description: " + result.description);
 
     return res.json({
       success: true,
-      description: description,
-      mode: isLong ? "long" : "short",
-      maxChars,
+      description: result.description,
+      mode: result.mode,
+      maxChars: result.maxChars,
+      source: result.source,
     });
   } catch (err) {
-    const errorMessage = err?.message || err;
+    const errorMessage = err?.message || String(err);
     logError("Error detail: " + JSON.stringify(err));
-    logError(`Error generating description for "${title}": ${errorMessage}`);
+    logError(`Error generating description: ${errorMessage}`);
 
     return res.json({
       success: false,
