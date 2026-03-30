@@ -107,7 +107,7 @@ The function includes robust error handling for:
 Run locally for quick iteration:
 
 1. Install dependencies:
-  
+
 ```bash
 npm install
 ```
@@ -118,7 +118,7 @@ npm install
 GEMINI_API_KEY=your_gemini_api_key
 SERPER_SEARCH_API_KEY=your_serper_search_api_key
 # Optional: GEMINI_MODEL (defaults to gemini-pro)
-GEMINI_MODEL=gemini-2.5-flash || gemini-3-flash-preview
+GEMINI_MODEL=gemini-1.5-pro || gemini-3-flash-preview
 ```
 
 3. Run the local tester:

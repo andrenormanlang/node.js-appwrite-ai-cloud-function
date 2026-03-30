@@ -85,7 +85,9 @@ function parseStructuredJson(text) {
 }
 
 function getMimeTypeFromResponse(response) {
-  const header = String(response?.headers?.["content-type"] || "").toLowerCase();
+  const header = String(
+    response?.headers?.["content-type"] || "",
+  ).toLowerCase();
   if (header.startsWith("image/")) {
     return header.split(";")[0];
   }
@@ -161,7 +163,14 @@ function getDescriptionLimits(mode, useImage) {
   };
 }
 
-function buildImagePrompt({ title, status, rating, isLong, minChars, maxChars }) {
+function buildImagePrompt({
+  title,
+  status,
+  rating,
+  isLong,
+  minChars,
+  maxChars,
+}) {
   return `Analyze this comic book cover for a comic shelf app and return JSON.
 
 Constraints:
@@ -440,7 +449,7 @@ ${description}
 module.exports = async function ({ req, res, log, error: logError }) {
   const apiKey = process.env.GEMINI_API_KEY;
   const searchApiKey = process.env.SERPER_SEARCH_API_KEY;
-  const modelName = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+  const modelName = process.env.GEMINI_MODEL || "gemini-1.5-pro";
 
   if (!apiKey) {
     const errorMsg = "Missing environment variables: GEMINI_API_KEY";
