@@ -95,6 +95,125 @@ function combineTitleAndIssue(title, issueNumber) {
   return clampTitle(`${normalizedTitle} ${formattedIssue}`);
 }
 
+function normalizeLocale(locale) {
+  const normalized = normalizeWhitespace(locale).toLowerCase();
+
+  if (!normalized) return "";
+  if (normalized.includes("pt-br") || normalized.includes("brazil")) {
+    return "pt-BR";
+  }
+  if (normalized.includes("en-us") || normalized.includes("english")) {
+    return "en-US";
+  }
+
+  return "";
+}
+
+function normalizePublisher(publisher, maxChars = 80) {
+  const normalized = normalizeWhitespace(publisher);
+  if (!normalized) return "";
+  return normalized.slice(0, maxChars).trim();
+}
+
+function normalizeEditionType(editionType, maxChars = 80) {
+  const normalized = normalizeWhitespace(editionType);
+  if (!normalized) return "";
+  return normalized.slice(0, maxChars).trim();
+}
+
+function normalizeVolume(volume, maxChars = 40) {
+  const normalized = normalizeWhitespace(volume)
+    .replace(/^volume\s*/i, "")
+    .trim();
+
+  if (!normalized) return "";
+  return normalized.slice(0, maxChars).trim();
+}
+
+function normalizeTotalIssues(totalIssues, maxChars = 20) {
+  const normalized = normalizeWhitespace(totalIssues)
+    .replace(/^de\s+/i, "")
+    .trim();
+
+  if (!normalized) return "";
+  return normalized.slice(0, maxChars).trim();
+}
+
+function buildResolvedTitle(metadata, fallbackTitle = "") {
+  const primaryTitle = combineTitleAndIssue(
+    metadata?.title || fallbackTitle,
+    metadata?.issueNumber || "",
+  );
+
+  if (!primaryTitle) return "";
+
+  const editionType = normalizeEditionType(metadata?.editionType || "");
+  const volume = normalizeVolume(metadata?.volume || "");
+  const totalIssues = normalizeTotalIssues(metadata?.totalIssues || "");
+  const extras = [];
+
+  if (volume) {
+    extras.push(`${volume} volume`);
+  }
+  if (editionType) {
+    extras.push(editionType);
+  }
+  if (totalIssues) {
+    extras.push(`${primaryTitle.includes("#") ? "of" : "de"} ${totalIssues}`);
+  }
+
+  return primaryTitle;
+}
+
+function buildSearchQuery(title, metadata = {}) {
+  const parts = [title];
+  const publisher = normalizePublisher(metadata.publisher || "");
+  const editionType = normalizeEditionType(metadata.editionType || "");
+  const volume = normalizeVolume(metadata.volume || "");
+  const totalIssues = normalizeTotalIssues(metadata.totalIssues || "");
+  const locale = normalizeLocale(metadata.locale || "");
+
+  if (volume) {
+    parts.push(`${volume} volume`);
+  }
+  if (editionType) {
+    parts.push(editionType);
+  }
+  if (totalIssues) {
+    parts.push(`${totalIssues} issues`);
+  }
+  if (publisher) {
+    parts.push(publisher);
+  }
+  if (locale === "pt-BR") {
+    parts.push("quadrinhos brasil");
+  }
+
+  return normalizeWhitespace(parts.filter(Boolean).join(" "));
+}
+
+function getOutputLanguage(metadata = {}, title = "") {
+  const locale = normalizeLocale(metadata.locale || "");
+  if (locale) {
+    return locale === "pt-BR" ? "Brazilian Portuguese" : "English";
+  }
+
+  const publisher = normalizePublisher(metadata.publisher || "").toLowerCase();
+  const normalizedTitle = normalizeWhitespace(title).toLowerCase();
+  if (
+    publisher.includes("abril") ||
+    publisher.includes("panini brasil") ||
+    publisher.includes("pixel") ||
+    normalizedTitle.includes("1ª série") ||
+    normalizedTitle.includes("nº") ||
+    normalizedTitle.includes("n°")
+  ) {
+    return "Brazilian Portuguese";
+  }
+
+  return "English";
+}
+
 function parseStructuredJson(text) {
   const raw = String(text || "").trim();
   if (!raw) {
@@ -138,13 +257,12 @@ async function fetchImageAsInlineData(imageUrl) {
   };
 }
 
-async function fetchSearchInfo(searchApiKey, title, log, logError) {
+async function fetchSearchInfo(searchApiKey, searchQuery, log, logError) {
   if (!searchApiKey) {
     log("SERPER_SEARCH_API_KEY not configured. Skipping search enrichment.");
     return [];
   }
 
-  const searchQuery = `${title} comic book`;
   const searchUrl = "https://google.serper.dev/search";
   log(`Searching for supporting comic info: ${searchQuery}`);
 
@@ -196,18 +314,24 @@ function buildImagePrompt({
   title,
   status,
   rating,
-  isLong,
-  minChars,
-  maxChars,
 }) {
   return `Analyze this comic book cover and return only the comic identification details as JSON.
 
 Constraints:
 - Identify the main comic title from the cover text when it is clearly legible.
 - Identify the issue number, volume number, or issue marker when it is clearly legible.
+- Identify the total number of issues in the mini-series or special edition when that information is clearly legible.
+- Identify the publisher/editor when that information is clearly legible.
+- Identify whether this edition is Brazilian Portuguese ("pt-BR") or American English ("en-US").
+- Identify whether the edition is a mini-series, special issue, annual, one-shot, or similar format when that is clearly legible.
 - If a title is provided, use it only when it matches the visible cover and do not invent issue numbers, creators, publishers, or story details.
 - If the title is not readable, return an empty string for "title".
 - If the issue number is not readable, return an empty string for "issueNumber".
+- If the total number of issues is not readable, return an empty string for "totalIssues".
+- If the publisher is not readable, return an empty string for "publisher".
+- If the locale is uncertain, infer it from the cover language and edition conventions. Return only "pt-BR" or "en-US".
+- If the edition type is not readable, return an empty string for "editionType".
+- Return only facts supported by the cover image.
 
 Comic metadata:
 Title: ${title || "Unknown"}
@@ -217,7 +341,12 @@ ${rating > 0 ? `Reader rating: ${rating}/5` : ""}
 Return strict JSON only in this shape:
 {
   "title": "string",
-  "issueNumber": "string"
+  "issueNumber": "string",
+  "volume": "string",
+  "totalIssues": "string",
+  "publisher": "string",
+  "locale": "pt-BR | en-US",
+  "editionType": "string"
 }`;
 }
 
@@ -229,6 +358,8 @@ function buildTextPrompt({
   minChars,
   maxChars,
   searchInfo,
+  metadata,
+  outputLanguage,
 }) {
   const hasSearch = searchInfo.length > 0;
   const searchContext = hasSearch
@@ -236,12 +367,23 @@ function buildTextPrompt({
         .map((info) => `Source: ${info.title}\nInfo: ${info.snippet}`)
         .join("\n\n")
     : "";
+  const metadataLines = [
+    metadata?.volume ? `Volume: ${metadata.volume}` : "",
+    metadata?.issueNumber ? `Issue Number: ${metadata.issueNumber}` : "",
+    metadata?.totalIssues ? `Total Issues: ${metadata.totalIssues}` : "",
+    metadata?.publisher ? `Publisher: ${metadata.publisher}` : "",
+    metadata?.editionType ? `Edition Type: ${metadata.editionType}` : "",
+    metadata?.locale ? `Edition Locale: ${metadata.locale}` : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 
-  return `Write a ${isLong ? "detailed" : "brief"}, engaging description for a comic book.
+  return `Write a ${isLong ? "detailed" : "brief"}, engaging description for a comic book in ${outputLanguage}.
 
 Constraints:
 - ${isLong ? `Target length: ${minChars}-${maxChars} characters (including spaces). Do not exceed ${maxChars}.` : `Max length: ${maxChars} characters.`}
 - Use the exact comic title provided, including the issue number when present, so the description matches that specific issue rather than the series in general.
+- If the metadata indicates volume, total issue count, publisher, locale, or edition type, incorporate only the details supported by search results or the provided metadata.
 - No spoilers.
 - Do not invent facts. If details are unknown, keep it general.
 - Avoid quoting or mentioning sources/search results.
@@ -252,6 +394,7 @@ Comic Details:
 Title: ${title}
 Status: ${status}
 ${rating > 0 ? `Rating: ${rating}/5` : ""}
+${metadataLines ? `${metadataLines}\n` : ""}
 
 ${hasSearch ? `Verified info (use only if relevant and supported by these snippets):\n\n${searchContext}\n\n` : ""}
 Return only the description text.`;
@@ -266,9 +409,25 @@ async function generateFromText({
   searchApiKey,
   log,
   logError,
+  metadata = {},
 }) {
-  const searchInfo = await fetchSearchInfo(searchApiKey, title, log, logError);
+  const normalizedMetadata = {
+    issueNumber: clampIssueNumber(metadata.issueNumber || ""),
+    volume: normalizeVolume(metadata.volume || ""),
+    totalIssues: normalizeTotalIssues(metadata.totalIssues || ""),
+    publisher: normalizePublisher(metadata.publisher || ""),
+    locale: normalizeLocale(metadata.locale || ""),
+    editionType: normalizeEditionType(metadata.editionType || ""),
+  };
+  const searchQuery = buildSearchQuery(title, normalizedMetadata);
+  const searchInfo = await fetchSearchInfo(
+    searchApiKey,
+    searchQuery,
+    log,
+    logError,
+  );
   const { isLong, minChars, maxChars } = getDescriptionLimits(mode, false);
+  const outputLanguage = getOutputLanguage(normalizedMetadata, title);
   const prompt = buildTextPrompt({
     title,
     status,
@@ -277,6 +436,8 @@ async function generateFromText({
     minChars,
     maxChars,
     searchInfo,
+    metadata: normalizedMetadata,
+    outputLanguage,
   });
 
   const result = await model.generateContent(prompt);
@@ -363,7 +524,7 @@ ${description}
   };
 }
 
-async function extractTitleFromImage({
+async function extractComicMetadataFromImage({
   model,
   imageUrl,
   title,
@@ -391,10 +552,20 @@ async function extractTitleFromImage({
   ]);
   const response = await result.response;
   const parsed = parseStructuredJson(response.text());
-  return combineTitleAndIssue(
-    parsed?.title || title || "",
-    parsed?.issueNumber || "",
-  );
+  const metadata = {
+    title: clampTitle(parsed?.title || title || ""),
+    issueNumber: clampIssueNumber(parsed?.issueNumber || ""),
+    volume: normalizeVolume(parsed?.volume || ""),
+    totalIssues: normalizeTotalIssues(parsed?.totalIssues || ""),
+    publisher: normalizePublisher(parsed?.publisher || ""),
+    locale: normalizeLocale(parsed?.locale || ""),
+    editionType: normalizeEditionType(parsed?.editionType || ""),
+  };
+
+  return {
+    ...metadata,
+    resolvedTitle: buildResolvedTitle(metadata, title || ""),
+  };
 }
 
 module.exports = async function ({ req, res, log, error: logError }) {
@@ -455,24 +626,33 @@ module.exports = async function ({ req, res, log, error: logError }) {
     const model = genAI.getGenerativeModel({ model: modelName });
 
     let resolvedTitle = normalizedTitle;
+    let resolvedMetadata = {};
     if (normalizedImageUrl) {
       try {
-        log("Extracting title and issue number from cover image...");
-        const extractedTitle = await extractTitleFromImage({
+        log("Extracting comic metadata from cover image...");
+        const extracted = await extractComicMetadataFromImage({
           model,
           imageUrl: normalizedImageUrl,
           title: normalizedTitle,
           status: normalizedStatus,
           rating: numericRating,
         });
+        resolvedMetadata = {
+          issueNumber: extracted.issueNumber,
+          volume: extracted.volume,
+          totalIssues: extracted.totalIssues,
+          publisher: extracted.publisher,
+          locale: extracted.locale,
+          editionType: extracted.editionType,
+        };
 
-        if (extractedTitle) {
-          resolvedTitle = extractedTitle;
+        if (extracted.resolvedTitle) {
+          resolvedTitle = extracted.resolvedTitle;
           log(`Resolved title from cover image: ${resolvedTitle}`);
         }
       } catch (imageError) {
         logError(
-          `Image-based title extraction failed: ${imageError.message || imageError}`,
+          `Image-based metadata extraction failed: ${imageError.message || imageError}`,
         );
 
         if (!normalizedTitle) {
@@ -496,6 +676,7 @@ module.exports = async function ({ req, res, log, error: logError }) {
       searchApiKey,
       log,
       logError,
+      metadata: resolvedMetadata,
     });
 
     log("Generated description: " + result.description);
