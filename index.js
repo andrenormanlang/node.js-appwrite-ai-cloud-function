@@ -139,6 +139,41 @@ function normalizeTotalIssues(totalIssues, maxChars = 20) {
   return normalized.slice(0, maxChars).trim();
 }
 
+function normalizePublicationYear(publicationYear) {
+  const normalized = normalizeWhitespace(publicationYear);
+  if (!normalized) return "";
+
+  const match = normalized.match(/\b(19|20)\d{2}\b/);
+  return match ? match[0] : "";
+}
+
+function normalizeCreatorName(name, maxChars = 60) {
+  const normalized = normalizeWhitespace(name)
+    .replace(/^["'`]+|["'`]+$/g, "")
+    .trim();
+
+  if (!normalized) return "";
+  return normalized.slice(0, maxChars).trim();
+}
+
+function normalizeCreators(creators) {
+  if (Array.isArray(creators)) {
+    return creators
+      .map((creator) => normalizeCreatorName(creator))
+      .filter(Boolean)
+      .slice(0, 6);
+  }
+
+  const raw = normalizeWhitespace(creators);
+  if (!raw) return [];
+
+  return raw
+    .split(/[,;/]|\s+-\s+/)
+    .map((creator) => normalizeCreatorName(creator))
+    .filter(Boolean)
+    .slice(0, 6);
+}
+
 function buildResolvedTitle(metadata, fallbackTitle = "") {
   const primaryTitle = combineTitleAndIssue(
     metadata?.title || fallbackTitle,
@@ -171,7 +206,9 @@ function buildSearchQuery(title, metadata = {}) {
   const editionType = normalizeEditionType(metadata.editionType || "");
   const volume = normalizeVolume(metadata.volume || "");
   const totalIssues = normalizeTotalIssues(metadata.totalIssues || "");
+  const publicationYear = normalizePublicationYear(metadata.publicationYear || "");
   const locale = normalizeLocale(metadata.locale || "");
+  const creators = normalizeCreators(metadata.creators || []);
 
   if (volume) {
     parts.push(`${volume} volume`);
@@ -182,8 +219,14 @@ function buildSearchQuery(title, metadata = {}) {
   if (totalIssues) {
     parts.push(`${totalIssues} issues`);
   }
+  if (publicationYear) {
+    parts.push(publicationYear);
+  }
   if (publisher) {
     parts.push(publisher);
+  }
+  if (creators.length > 0) {
+    parts.push(creators.join(" "));
   }
   if (locale === "pt-BR") {
     parts.push("quadrinhos brasil");
@@ -321,14 +364,18 @@ Constraints:
 - Identify the main comic title from the cover text when it is clearly legible.
 - Identify the issue number, volume number, or issue marker when it is clearly legible.
 - Identify the total number of issues in the mini-series or special edition when that information is clearly legible.
+- Identify the publication year when that information is clearly legible.
 - Identify the publisher/editor when that information is clearly legible.
+- Identify creator names such as writer, artist, penciler, inker, colorist, or cover artist when they are clearly legible.
 - Identify whether this edition is Brazilian Portuguese ("pt-BR") or American English ("en-US").
 - Identify whether the edition is a mini-series, special issue, annual, one-shot, or similar format when that is clearly legible.
 - If a title is provided, use it only when it matches the visible cover and do not invent issue numbers, creators, publishers, or story details.
 - If the title is not readable, return an empty string for "title".
 - If the issue number is not readable, return an empty string for "issueNumber".
 - If the total number of issues is not readable, return an empty string for "totalIssues".
+- If the publication year is not readable, return an empty string for "publicationYear".
 - If the publisher is not readable, return an empty string for "publisher".
+- If creator names are not readable, return an empty array for "creators".
 - If the locale is uncertain, infer it from the cover language and edition conventions. Return only "pt-BR" or "en-US".
 - If the edition type is not readable, return an empty string for "editionType".
 - Return only facts supported by the cover image.
@@ -344,7 +391,9 @@ Return strict JSON only in this shape:
   "issueNumber": "string",
   "volume": "string",
   "totalIssues": "string",
+  "publicationYear": "string",
   "publisher": "string",
+  "creators": ["string"],
   "locale": "pt-BR | en-US",
   "editionType": "string"
 }`;
@@ -371,7 +420,13 @@ function buildTextPrompt({
     metadata?.volume ? `Volume: ${metadata.volume}` : "",
     metadata?.issueNumber ? `Issue Number: ${metadata.issueNumber}` : "",
     metadata?.totalIssues ? `Total Issues: ${metadata.totalIssues}` : "",
+    metadata?.publicationYear
+      ? `Publication Year: ${metadata.publicationYear}`
+      : "",
     metadata?.publisher ? `Publisher: ${metadata.publisher}` : "",
+    metadata?.creators?.length
+      ? `Creators on Cover: ${metadata.creators.join(", ")}`
+      : "",
     metadata?.editionType ? `Edition Type: ${metadata.editionType}` : "",
     metadata?.locale ? `Edition Locale: ${metadata.locale}` : "",
   ]
@@ -383,7 +438,9 @@ function buildTextPrompt({
 Constraints:
 - ${isLong ? `Target length: ${minChars}-${maxChars} characters (including spaces). Do not exceed ${maxChars}.` : `Max length: ${maxChars} characters.`}
 - Use the exact comic title provided, including the issue number when present, so the description matches that specific issue rather than the series in general.
-- If the metadata indicates volume, total issue count, publisher, locale, or edition type, incorporate only the details supported by search results or the provided metadata.
+- If the metadata indicates volume, total issue count, publication year, publisher, creator names, locale, or edition type, incorporate only the details supported by search results or the provided metadata.
+- Use creator names to distinguish between editions with the same title and issue number when the credited team differs.
+- Use the publication year to distinguish between editions with the same title and issue number when multiple releases exist.
 - No spoilers.
 - Do not invent facts. If details are unknown, keep it general.
 - Avoid quoting or mentioning sources/search results.
@@ -415,7 +472,9 @@ async function generateFromText({
     issueNumber: clampIssueNumber(metadata.issueNumber || ""),
     volume: normalizeVolume(metadata.volume || ""),
     totalIssues: normalizeTotalIssues(metadata.totalIssues || ""),
+    publicationYear: normalizePublicationYear(metadata.publicationYear || ""),
     publisher: normalizePublisher(metadata.publisher || ""),
+    creators: normalizeCreators(metadata.creators || []),
     locale: normalizeLocale(metadata.locale || ""),
     editionType: normalizeEditionType(metadata.editionType || ""),
   };
@@ -557,7 +616,9 @@ async function extractComicMetadataFromImage({
     issueNumber: clampIssueNumber(parsed?.issueNumber || ""),
     volume: normalizeVolume(parsed?.volume || ""),
     totalIssues: normalizeTotalIssues(parsed?.totalIssues || ""),
+    publicationYear: normalizePublicationYear(parsed?.publicationYear || ""),
     publisher: normalizePublisher(parsed?.publisher || ""),
+    creators: normalizeCreators(parsed?.creators || []),
     locale: normalizeLocale(parsed?.locale || ""),
     editionType: normalizeEditionType(parsed?.editionType || ""),
   };
@@ -641,7 +702,9 @@ module.exports = async function ({ req, res, log, error: logError }) {
           issueNumber: extracted.issueNumber,
           volume: extracted.volume,
           totalIssues: extracted.totalIssues,
+          publicationYear: extracted.publicationYear,
           publisher: extracted.publisher,
+          creators: extracted.creators,
           locale: extracted.locale,
           editionType: extracted.editionType,
         };
