@@ -275,6 +275,143 @@ function parseStructuredJson(text) {
   return JSON.parse(jsonText);
 }
 
+function isGeminiUnsupportedLocationError(err) {
+  const message = String(err?.message || err || "").toLowerCase();
+  return (
+    message.includes("user location is not supported") ||
+    message.includes("location is not supported for the api use")
+  );
+}
+
+function createProviderRegionError(message) {
+  const error = new Error(message);
+  error.code = "provider_region_unsupported";
+  return error;
+}
+
+function isProviderRegionError(err) {
+  return (
+    err?.code === "provider_region_unsupported" ||
+    isGeminiUnsupportedLocationError(err)
+  );
+}
+
+function buildFriendlyProviderError({ needsImageTitle = false } = {}) {
+  if (needsImageTitle) {
+    return "The AI provider blocked cover analysis from this server region. Add the comic title manually and try again, or switch to another provider.";
+  }
+
+  return "The AI provider blocked this request from the current server region. We could not use Gemini for this step.";
+}
+
+function summarizeSearchSnippets(searchInfo, maxItems = 2) {
+  return searchInfo
+    .map((item) => normalizeWhitespace(item?.snippet || ""))
+    .filter(Boolean)
+    .slice(0, maxItems);
+}
+
+function buildMetadataFactList(metadata = {}, outputLanguage = "English") {
+  const facts = [];
+
+  if (metadata.issueNumber) {
+    facts.push(
+      outputLanguage === "Brazilian Portuguese"
+        ? `a edição indicada é a de número ${metadata.issueNumber}`
+        : `the identified issue marker is ${metadata.issueNumber}`,
+    );
+  }
+  if (metadata.volume) {
+    facts.push(
+      outputLanguage === "Brazilian Portuguese"
+        ? `ela pertence ao volume ${metadata.volume}`
+        : `it belongs to volume ${metadata.volume}`,
+    );
+  }
+  if (metadata.totalIssues) {
+    facts.push(
+      outputLanguage === "Brazilian Portuguese"
+        ? `a capa indica um conjunto de ${metadata.totalIssues} edições`
+        : `the cover points to a set of ${metadata.totalIssues} issues`,
+    );
+  }
+  if (metadata.publicationYear) {
+    facts.push(
+      outputLanguage === "Brazilian Portuguese"
+        ? `o ano de publicação visível é ${metadata.publicationYear}`
+        : `the visible publication year is ${metadata.publicationYear}`,
+    );
+  }
+  if (metadata.publisher) {
+    facts.push(
+      outputLanguage === "Brazilian Portuguese"
+        ? `a editora indicada é ${metadata.publisher}`
+        : `the credited publisher is ${metadata.publisher}`,
+    );
+  }
+  if (metadata.editionType) {
+    facts.push(
+      outputLanguage === "Brazilian Portuguese"
+        ? `o formato aparente é ${metadata.editionType}`
+        : `the apparent edition format is ${metadata.editionType}`,
+    );
+  }
+  if (metadata.creators?.length) {
+    facts.push(
+      outputLanguage === "Brazilian Portuguese"
+        ? `os nomes destacados na capa incluem ${metadata.creators.join(", ")}`
+        : `the cover credits highlighted creators including ${metadata.creators.join(", ")}`,
+    );
+  }
+
+  return facts;
+}
+
+function buildSearchOnlyFallbackDescription({
+  title,
+  status,
+  rating,
+  metadata = {},
+  searchInfo = [],
+  outputLanguage = "English",
+}) {
+  const facts = buildMetadataFactList(metadata, outputLanguage);
+  const snippets = summarizeSearchSnippets(searchInfo);
+
+  let description;
+  if (outputLanguage === "Brazilian Portuguese") {
+    const paragraph1 = `${title} é tratado aqui como uma edição específica, e não apenas como uma referência geral da série. ${
+      facts.length > 0
+        ? `Pelos dados identificados, ${facts.join("; ")}.`
+        : "Os elementos disponíveis apontam para uma edição definida por seus próprios créditos e contexto editorial."
+    }`;
+    const paragraph2 = snippets.length > 0
+      ? `As informações encontradas para essa edição indicam o seguinte: ${snippets.join(" ")}`
+      : "Sem apoio do provedor principal de IA, a melhor leitura deste registro é a de uma publicação que precisa ser interpretada pelo título completo, pelos créditos visíveis e pelo enquadramento editorial mostrado na capa.";
+    const paragraph3 = status === "read" && rating > 0
+      ? `Para quem já leu e avaliou esta edição em ${rating}/5, a descrição acima prioriza a identificação correta do lançamento para diferenciar esta publicação de outras com o mesmo título ou numeração semelhante.`
+      : "Para quem ainda vai ler, o mais importante é considerar o título completo, a numeração, os créditos e o contexto editorial para evitar confundir esta edição com outras versões do mesmo personagem ou série.";
+
+    description = `${paragraph1}\n\n${paragraph2}\n\n${paragraph3}`;
+  } else {
+    const paragraph1 = `${title} is handled here as a specific comic edition rather than as a generic reference to the wider series. ${
+      facts.length > 0
+        ? `From the identified details, ${facts.join("; ")}.`
+        : "The available signals point to an edition defined by its own credits and publication context."
+    }`;
+    const paragraph2 = snippets.length > 0
+      ? `The search information associated with this edition suggests the following: ${snippets.join(" ")}`
+      : "Without the primary AI provider, the safest reading is to anchor this entry to the full title, visible credits, and edition context shown on the cover so it is not confused with other releases carrying the same series name.";
+    const paragraph3 = status === "read" && rating > 0
+      ? `Since this copy is marked as read and rated ${rating}/5, the description focuses on identifying the exact release as clearly as possible so it stays distinct from other editions sharing the same title or numbering.`
+      : "For someone approaching it now, the key is to treat the full title, numbering, credited team, and edition context as part of the identity of this release, especially when multiple comics share the same title and issue number.";
+
+    description = `${paragraph1}\n\n${paragraph2}\n\n${paragraph3}`;
+  }
+
+  return clampTextWithinRange(description, 600, 800);
+}
+
 function getMimeTypeFromResponse(response) {
   const header = String(
     response?.headers?.["content-type"] || "",
@@ -498,32 +635,32 @@ async function generateFromText({
     metadata: normalizedMetadata,
     outputLanguage,
   });
+  try {
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
 
-  const result = await model.generateContent(prompt);
-  const response = await result.response;
+    let description = isLong
+      ? clampTextWithinRange(response.text(), minChars, maxChars)
+      : clampText(response.text(), maxChars);
 
-  let description = isLong
-    ? clampTextWithinRange(response.text(), minChars, maxChars)
-    : clampText(response.text(), maxChars);
+    if (!isLong) {
+      return {
+        title: clampTitle(title),
+        description,
+        mode: "short",
+        maxChars,
+        source: "title",
+      };
+    }
 
-  if (!isLong) {
-    return {
-      title: clampTitle(title),
-      description,
-      mode: "short",
-      maxChars,
-      source: "title",
-    };
-  }
+    let attempts = 0;
+    while (description.length < minChars && attempts < 4) {
+      attempts += 1;
+      log(
+        `Text description too short (${description.length} chars). Expanding (attempt ${attempts})...`,
+      );
 
-  let attempts = 0;
-  while (description.length < minChars && attempts < 4) {
-    attempts += 1;
-    log(
-      `Text description too short (${description.length} chars). Expanding (attempt ${attempts})...`,
-    );
-
-    const expandPrompt = `Expand the following comic description to be between ${minChars} and ${maxChars} characters (including spaces).
+      const expandPrompt = `Expand the following comic description to be between ${minChars} and ${maxChars} characters (including spaces).
 
 Rules:
 - Keep the same facts; do not add new factual claims (no new names, events, publishers, creators, dates).
@@ -538,21 +675,21 @@ Original description:
 ${description}
 """`;
 
-    const expandResult = await model.generateContent(expandPrompt);
-    const expandResponse = await expandResult.response;
-    description = clampTextWithinRange(
-      expandResponse.text(),
-      minChars,
-      maxChars,
-    );
-  }
+      const expandResult = await model.generateContent(expandPrompt);
+      const expandResponse = await expandResult.response;
+      description = clampTextWithinRange(
+        expandResponse.text(),
+        minChars,
+        maxChars,
+      );
+    }
 
-  if (description.length < minChars || description.length > maxChars) {
-    log(
-      `Text description out of bounds (${description.length}). Forcing strict rewrite to ${minChars}-${maxChars}...`,
-    );
+    if (description.length < minChars || description.length > maxChars) {
+      log(
+        `Text description out of bounds (${description.length}). Forcing strict rewrite to ${minChars}-${maxChars}...`,
+      );
 
-    const strictPrompt = `Rewrite the following into exactly 3 short paragraphs and ensure the result is between ${minChars} and ${maxChars} characters (including spaces).
+      const strictPrompt = `Rewrite the following into exactly 3 short paragraphs and ensure the result is between ${minChars} and ${maxChars} characters (including spaces).
 
 Rules:
 - No spoilers.
@@ -565,22 +702,46 @@ Input:
 ${description}
 """`;
 
-    const strictResult = await model.generateContent(strictPrompt);
-    const strictResponse = await strictResult.response;
-    description = clampTextWithinRange(
-      strictResponse.text(),
-      minChars,
-      maxChars,
-    );
-  }
+      const strictResult = await model.generateContent(strictPrompt);
+      const strictResponse = await strictResult.response;
+      description = clampTextWithinRange(
+        strictResponse.text(),
+        minChars,
+        maxChars,
+      );
+    }
 
-  return {
-    title: clampTitle(title),
-    description,
-    mode: "long",
-    maxChars,
-    source: "title",
-  };
+    return {
+      title: clampTitle(title),
+      description,
+      mode: "long",
+      maxChars,
+      source: "title",
+    };
+  } catch (err) {
+    if (isGeminiUnsupportedLocationError(err)) {
+      log(
+        "Gemini blocked this server region for text generation. Falling back to a Serper-only description.",
+      );
+
+      return {
+        title: clampTitle(title),
+        description: buildSearchOnlyFallbackDescription({
+          title,
+          status,
+          rating,
+          metadata: normalizedMetadata,
+          searchInfo,
+          outputLanguage,
+        }),
+        mode: isLong ? "long" : "short",
+        maxChars,
+        source: "search-fallback",
+      };
+    }
+
+    throw err;
+  }
 }
 
 async function extractComicMetadataFromImage({
@@ -600,17 +761,31 @@ async function extractComicMetadataFromImage({
     maxChars: 800,
   });
 
-  const result = await model.generateContent([
-    prompt,
-    {
-      inlineData: {
-        mimeType,
-        data,
+  let parsed;
+  try {
+    const result = await model.generateContent([
+      prompt,
+      {
+        inlineData: {
+          mimeType,
+          data,
+        },
       },
-    },
-  ]);
-  const response = await result.response;
-  const parsed = parseStructuredJson(response.text());
+    ]);
+    const response = await result.response;
+    parsed = parseStructuredJson(response.text());
+  } catch (err) {
+    if (isGeminiUnsupportedLocationError(err)) {
+      throw createProviderRegionError(
+        buildFriendlyProviderError({
+          needsImageTitle: !clampTitle(title),
+        }),
+      );
+    }
+
+    throw err;
+  }
+
   const metadata = {
     title: clampTitle(parsed?.title || title || ""),
     issueNumber: clampIssueNumber(parsed?.issueNumber || ""),
@@ -718,8 +893,18 @@ module.exports = async function ({ req, res, log, error: logError }) {
           `Image-based metadata extraction failed: ${imageError.message || imageError}`,
         );
 
+        if (isProviderRegionError(imageError) && normalizedTitle) {
+          log(
+            "Cover analysis is blocked in this server region, but a manual title is available. Continuing with Serper-backed title generation.",
+          );
+        }
+
         if (!normalizedTitle) {
-          throw imageError;
+          throw isProviderRegionError(imageError)
+            ? createProviderRegionError(
+                buildFriendlyProviderError({ needsImageTitle: true }),
+              )
+            : imageError;
         }
 
         log("Falling back to title-based generation.");
@@ -759,6 +944,9 @@ module.exports = async function ({ req, res, log, error: logError }) {
 
     return res.json({
       success: false,
+      errorCode: isProviderRegionError(err)
+        ? "provider_region_unsupported"
+        : "generation_failed",
       error:
         err.response?.data?.error?.message ||
         err.message ||
